@@ -3,9 +3,11 @@ use serde_json::Value;
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
+    sync::mpsc,
+    thread,
     path::Path,
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
@@ -193,24 +195,35 @@ fn codex_window(window: &Value) -> Option<(i64, String)> {
     Some((minutes, format!("{label} {}%", 100 - used)))
 }
 
+// 拉取 rateLimits，单进程、单请求、3 秒超时
 fn read_codex_limits(cli: &str) -> Option<String> {
-    let mut child = Command::new(cli)
+    let mut child = match Command::new(cli)
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
 
-    let mut stdin = child.stdin.take()?;
+    let mut stdin = match child.stdin.take() {
+        Some(value) => value,
+        None => { let _ = child.kill(); return None; }
+    };
     let initialize = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": { "clientInfo": { "name": "Token 看板", "version": "0.2.0" }, "capabilities": { "experimentalApi": true } }
+    });
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0", "method": "initialized", "params": Value::Null
     });
     let read_limits = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": Value::Null
     });
     if writeln!(stdin, "{initialize}").is_err()
+        || writeln!(stdin, "{initialized}").is_err()
         || writeln!(stdin, "{read_limits}").is_err()
         || stdin.flush().is_err()
     {
@@ -218,25 +231,111 @@ fn read_codex_limits(cli: &str) -> Option<String> {
         return None;
     }
 
-    let stdout = child.stdout.take()?;
-    let reader = BufReader::new(stdout);
-    let mut value = None;
-    for line in reader.lines().take(64) {
-        let Ok(line) = line else { break };
-        let Ok(payload) = serde_json::from_str::<Value>(&line) else { continue };
-        if payload.get("id").and_then(Value::as_i64) != Some(2) { continue; }
-        let Some(limits) = payload.pointer("/result/rateLimits") else { break };
-        let mut windows = ["secondary", "primary"].into_iter()
-            .filter_map(|name| limits.get(name).and_then(codex_window))
-            .collect::<Vec<_>>();
-        windows.sort_by_key(|(minutes, _)| *minutes);
-        if !windows.is_empty() {
-            value = Some(windows.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join(" / "));
+    let stdout = match child.stdout.take() {
+        Some(value) => value,
+        None => { let _ = child.kill(); return None; }
+    };
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().take(64) {
+            let Ok(line) = line else { break };
+            let Ok(payload) = serde_json::from_str::<Value>(&line) else { continue };
+            if payload.get("id").and_then(Value::as_i64) != Some(2) { continue; }
+            let Some(limits) = payload.pointer("/result/rateLimits") else { break };
+            let mut windows = ["secondary", "primary"].into_iter()
+                .filter_map(|name| limits.get(name).and_then(codex_window))
+                .collect::<Vec<_>>();
+            windows.sort_by_key(|(minutes, _)| *minutes);
+            let value = if windows.is_empty() { None } else {
+                Some(windows.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join(" / "))
+            };
+            let _ = tx.send(value);
+            break;
         }
-        break;
-    }
+    });
+
+    let result = rx.recv_timeout(Duration::from_secs(3)).ok().flatten();
     let _ = child.kill();
-    value
+    result
+}
+
+// 拉取套餐，独立进程，独立超时。失败不影响额度显示
+fn read_codex_plan(cli: &str) -> Option<String> {
+    let mut child = match Command::new(cli)
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+
+    let mut stdin = match child.stdin.take() {
+        Some(value) => value,
+        None => { let _ = child.kill(); return None; }
+    };
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": { "name": "Token 看板", "version": "0.2.0" }, "capabilities": { "experimentalApi": true } }
+    });
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0", "method": "initialized", "params": Value::Null
+    });
+    let read_account = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "account/read", "params": { "refreshToken": false }
+    });
+    if writeln!(stdin, "{initialize}").is_err()
+        || writeln!(stdin, "{initialized}").is_err()
+        || writeln!(stdin, "{read_account}").is_err()
+        || stdin.flush().is_err()
+    {
+        let _ = child.kill();
+        return None;
+    }
+
+    let stdout = match child.stdout.take() {
+        Some(value) => value,
+        None => { let _ = child.kill(); return None; }
+    };
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().take(64) {
+            let Ok(line) = line else { break };
+            let Ok(payload) = serde_json::from_str::<Value>(&line) else { continue };
+            if payload.get("id").and_then(Value::as_i64) != Some(3) { continue; }
+            let plan = payload.pointer("/result/account/planType")
+                .and_then(Value::as_str)
+                .map(|s| s.to_uppercase_first());
+            let _ = tx.send(plan);
+            break;
+        }
+    });
+
+    let result = rx.recv_timeout(Duration::from_secs(3)).ok().flatten();
+    let _ = child.kill();
+    result
+}
+
+// 把 "pro" → "Pro"，"self_serve_business_usage_based" → "Self Serve Business Usage Based"
+trait StrExt { fn to_uppercase_first(self) -> String; }
+impl StrExt for &str {
+    fn to_uppercase_first(self) -> String {
+        self.split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 fn codex_line() -> QuotaLine {
@@ -245,13 +344,23 @@ fn codex_line() -> QuotaLine {
     } else {
         "codex"
     };
-    for attempt in 0..2 {
-        if let Some(value) = read_codex_limits(cli) {
-            return QuotaLine { provider: "CODEX", value, plan: Some("Plus".into()) };
+    // 先把额度拿到（保证主显示出来），再用 best-effort 拉套餐
+    let value = {
+        let mut result = None;
+        for attempt in 0..2 {
+            if let Some(v) = read_codex_limits(cli) {
+                result = Some(v);
+                break;
+            }
+            if attempt == 0 { std::thread::sleep(std::time::Duration::from_millis(600)); }
         }
-        if attempt == 0 { std::thread::sleep(std::time::Duration::from_millis(600)); }
+        result
+    };
+    let plan = read_codex_plan(cli);
+    match value {
+        Some(v) => QuotaLine { provider: "CODEX", value: v, plan },
+        None => QuotaLine { provider: "CODEX", value: "读取失败".into(), plan },
     }
-    QuotaLine { provider: "CODEX", value: "读取失败".into(), plan: Some("Plus".into()) }
 }
 
 #[tauri::command]
