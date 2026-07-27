@@ -14,6 +14,8 @@ const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 struct QuotaLine {
     provider: &'static str,
     value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
 }
 
 fn home_file(path: &str) -> Option<std::path::PathBuf> {
@@ -40,21 +42,22 @@ fn remaining(used: i64, limit: i64) -> String {
 
 async fn glm_line(client: &reqwest::Client) -> QuotaLine {
     let Some(key) = provider_key("Zhipu GLM") else {
-        return QuotaLine { provider: "GLM", value: "未配置".into() };
+        return QuotaLine { provider: "GLM", value: "未配置".into(), plan: None };
     };
     let response = match client.get("https://open.bigmodel.cn/api/monitor/usage/quota/limit")
         .bearer_auth(key).send().await.and_then(|r| r.error_for_status()) {
         Ok(value) => value,
-        Err(_) => return QuotaLine { provider: "GLM", value: "读取失败".into() },
+        Err(_) => return QuotaLine { provider: "GLM", value: "读取失败".into(), plan: None },
     };
-    let payload: Value = match response.json().await { Ok(value) => value, Err(_) => return QuotaLine { provider: "GLM", value: "读取失败".into() } };
+    let payload: Value = match response.json().await { Ok(value) => value, Err(_) => return QuotaLine { provider: "GLM", value: "读取失败".into(), plan: None } };
     let mut limits: Vec<&Value> = payload.pointer("/data/limits").and_then(Value::as_array).into_iter().flatten()
         .filter(|item| item["type"].as_str() == Some("TOKENS_LIMIT")).collect();
     limits.sort_by_key(|item| number(item.get("nextResetTime")).unwrap_or(i64::MAX));
     let pct = |item: &Value| format!("{}%", 100 - number(item.get("percentage")).unwrap_or(100));
+    let plan = payload.pointer("/data/level").and_then(Value::as_str).map(String::from);
     match (limits.first(), limits.last()) {
-        (Some(first), Some(last)) => QuotaLine { provider: "GLM", value: format!("5h {} / 7d {}", pct(first), pct(last)) },
-        _ => QuotaLine { provider: "GLM", value: "暂无额度".into() },
+        (Some(first), Some(last)) => QuotaLine { provider: "GLM", value: format!("5h {} / 7d {}", pct(first), pct(last)), plan },
+        _ => QuotaLine { provider: "GLM", value: "暂无额度".into(), plan },
     }
 }
 
@@ -94,19 +97,19 @@ async fn kimi_usages(client: &reqwest::Client, token: &str) -> Option<Value> {
 }
 
 async fn kimi_line(client: &reqwest::Client) -> QuotaLine {
-    let Some(path) = home_file(".kimi/credentials/kimi-code.json") else {
-        return QuotaLine { provider: "KIMI", value: "未登录".into() };
+    let Some(path) = home_file(".kimi-code/credentials/kimi-code.json") else {
+        return QuotaLine { provider: "KIMI", value: "未登录".into(), plan: None };
     };
     let mut credential: Value = match fs::read(&path).ok().and_then(|data| serde_json::from_slice(&data).ok()) {
         Some(value) => value,
-        None => return QuotaLine { provider: "KIMI", value: "未登录".into() },
+        None => return QuotaLine { provider: "KIMI", value: "未登录".into(), plan: None },
     };
     let mut token = credential["access_token"].as_str().unwrap_or_default().to_owned();
     let expires_at = credential["expires_at"].as_f64().unwrap_or(0.0);
     if token.is_empty() || expires_at < now_secs() + 60.0 {
         match kimi_refresh(client, &path, &mut credential).await {
             Some(new_token) => token = new_token,
-            None => return QuotaLine { provider: "KIMI", value: "认证失效".into() },
+            None => return QuotaLine { provider: "KIMI", value: "认证失效".into(), plan: None },
         }
     }
     // 本地未过期但服务端拒绝（如凭据已在别处轮换）时，强制刷新重试一次
@@ -115,12 +118,23 @@ async fn kimi_line(client: &reqwest::Client) -> QuotaLine {
         None => match kimi_refresh(client, &path, &mut credential).await {
             Some(new_token) => match kimi_usages(client, &new_token).await {
                 Some(value) => value,
-                None => return QuotaLine { provider: "KIMI", value: "认证失效".into() },
+                None => return QuotaLine { provider: "KIMI", value: "认证失效".into(), plan: None },
             },
-            None => return QuotaLine { provider: "KIMI", value: "认证失效".into() },
+            None => return QuotaLine { provider: "KIMI", value: "认证失效".into(), plan: None },
         },
     };
     let mut rows: Vec<(String, String)> = vec![];
+    let plan = payload.get("user").and_then(Value::as_object)
+        .and_then(|u| u.get("membership").and_then(Value::as_object))
+        .and_then(|m| m.get("level").and_then(Value::as_str))
+        .map(|level| match level {
+            "LEVEL_FREE" => "Adagio".to_string(),
+            "LEVEL_TRIAL" => "Andante".to_string(),
+            "LEVEL_BASIC" => "Moderato".to_string(),
+            "LEVEL_INTERMEDIATE" => "Allegretto".to_string(),
+            "LEVEL_ADVANCED" => "Allegro".to_string(),
+            other => other.trim_start_matches("LEVEL_").to_string(),
+        });
     if let Some(limits) = payload["limits"].as_array() {
         for item in limits {
             let detail = item.get("detail").unwrap_or(item);
@@ -145,25 +159,25 @@ async fn kimi_line(client: &reqwest::Client) -> QuotaLine {
     let five_hour = rows.iter().find(|(name, _)| name.contains("5h") || name.contains("5H")).or_else(|| rows.first());
     let seven_day = rows.iter().find(|(name, _)| name.contains("7d") || name.contains("7D")).or_else(|| rows.get(1));
     match (five_hour, seven_day) {
-        (Some((_, h5)), Some((_, d7))) => QuotaLine { provider: "KIMI", value: format!("5h {h5} / 7d {d7}") },
-        (Some((name, pct)), None) => QuotaLine { provider: "KIMI", value: format!("{name} {pct}") },
-        _ => QuotaLine { provider: "KIMI", value: "暂无额度".into() },
+        (Some((_, h5)), Some((_, d7))) => QuotaLine { provider: "KIMI", value: format!("5h {h5} / 7d {d7}"), plan },
+        (Some((name, pct)), None) => QuotaLine { provider: "KIMI", value: format!("{name} {pct}"), plan },
+        _ => QuotaLine { provider: "KIMI", value: "暂无额度".into(), plan },
     }
 }
 
 async fn deepseek_line(client: &reqwest::Client) -> QuotaLine {
     let Some(key) = provider_key("DeepSeek") else {
-        return QuotaLine { provider: "DEEPSEEK", value: "未配置".into() };
+        return QuotaLine { provider: "DEEPSEEK", value: "未配置".into(), plan: Some("Token".into()) };
     };
     let response = match client.get("https://api.deepseek.com/user/balance")
         .bearer_auth(key).send().await.and_then(|r| r.error_for_status()) {
         Ok(value) => value,
-        Err(_) => return QuotaLine { provider: "DEEPSEEK", value: "读取失败".into() },
+        Err(_) => return QuotaLine { provider: "DEEPSEEK", value: "读取失败".into(), plan: Some("Token".into()) },
     };
-    let payload: Value = match response.json().await { Ok(value) => value, Err(_) => return QuotaLine { provider: "DEEPSEEK", value: "读取失败".into() } };
+    let payload: Value = match response.json().await { Ok(value) => value, Err(_) => return QuotaLine { provider: "DEEPSEEK", value: "读取失败".into(), plan: Some("Token".into()) } };
     let balance = payload["balance_infos"].as_array().and_then(|items| items.first())
         .and_then(|item| item["total_balance"].as_str()).unwrap_or("—");
-    QuotaLine { provider: "DEEPSEEK", value: format!("余额 ¥{balance}") }
+    QuotaLine { provider: "DEEPSEEK", value: format!("余额 ¥{balance}"), plan: Some("Token".into()) }
 }
 
 fn codex_window(window: &Value) -> Option<(i64, String)> {
@@ -233,11 +247,11 @@ fn codex_line() -> QuotaLine {
     };
     for attempt in 0..2 {
         if let Some(value) = read_codex_limits(cli) {
-            return QuotaLine { provider: "CODEX", value };
+            return QuotaLine { provider: "CODEX", value, plan: Some("Plus".into()) };
         }
         if attempt == 0 { std::thread::sleep(std::time::Duration::from_millis(600)); }
     }
-    QuotaLine { provider: "CODEX", value: "读取失败".into() }
+    QuotaLine { provider: "CODEX", value: "读取失败".into(), plan: Some("Plus".into()) }
 }
 
 #[tauri::command]
@@ -246,7 +260,7 @@ async fn get_quotas() -> Vec<QuotaLine> {
     let Ok(client) = client else { return vec![] };
     let codex = tauri::async_runtime::spawn_blocking(codex_line);
     let mut quotas = vec![kimi_line(&client).await, glm_line(&client).await, deepseek_line(&client).await];
-    let codex = codex.await.unwrap_or(QuotaLine { provider: "CODEX", value: "读取失败".into() });
+    let codex = codex.await.unwrap_or(QuotaLine { provider: "CODEX", value: "读取失败".into(), plan: Some("Plus".into()) });
     quotas.insert(0, codex);
     quotas
 }

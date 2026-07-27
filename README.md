@@ -29,7 +29,7 @@ CODEX 额度不是手动粘贴 OpenAI API Key 获取的，而是来自 ChatGPT/C
 ### KIMI
 
 1. 安装 Kimi Code CLI 后执行 `kimi login`，按设备授权流程完成登录。
-2. 登录成功后，Kimi Code 会在 `~/.kimi/credentials/kimi-code.json` 保存访问凭据。
+2. 登录成功后，Kimi Code 会在 `~/.kimi-code/credentials/kimi-code.json` 保存访问凭据。
 3. access_token 有效期只有约 15 分钟，看板会在过期时自动用 refresh_token 换新并写回该文件；不要复制、编辑或上传此文件。
 
 ### GLM（智谱）
